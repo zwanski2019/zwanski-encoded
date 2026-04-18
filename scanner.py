@@ -239,6 +239,168 @@ class BypassEngine:
         return ["GET", "POST", "HEAD", "OPTIONS", "TRACE", "ACL", "PROPFIND", "PURGE"]
 
 
+# ─── AI Analyzer (OpenRouter) ─────────────────────────────────────────────────
+class AIAnalyzer:
+    """
+    OpenRouter API wrapper. Uses urllib so it works in restricted envs
+    (Streamlit Cloud, Pyodide-via-proxy, etc.) without adding openai/httpx deps.
+
+    OpenRouter endpoint:  https://openrouter.ai/api/v1/chat/completions
+    Free models as of 2026 (verify at openrouter.ai/models):
+      - deepseek/deepseek-chat-v3:free        (strong reasoning, long context)
+      - google/gemini-2.0-flash-exp:free      (fast, good JSON)
+      - meta-llama/llama-3.3-70b-instruct:free
+      - qwen/qwen-2.5-coder-32b-instruct:free (best for code/exploits)
+    Paid but cheap + strong:
+      - anthropic/claude-3.5-sonnet
+      - openai/gpt-4o-mini
+    """
+
+    ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str, timeout: int = 60):
+        self.api_key = api_key.strip()
+        self.model = model
+        self.timeout = timeout
+
+    def _chat(self, system: str, user: str, temperature: float = 0.2,
+              max_tokens: int = 2000) -> tuple[bool, str]:
+        """Returns (ok, content_or_error)."""
+        if not self.api_key:
+            return False, "No API key set"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://zwanski.bio",
+            "X-Title": "Zwanski Security Scanner",
+        }
+        try:
+            req = urllib.request.Request(
+                self.ENDPOINT,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            if "choices" not in body or not body["choices"]:
+                return False, f"Unexpected response: {json.dumps(body)[:500]}"
+            return True, body["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(e)
+            return False, f"HTTP {e.code}: {err_body[:500]}"
+        except Exception as e:
+            return False, f"Error: {type(e).__name__}: {e}"
+
+    # ── built-in analysis tasks ────────────────────────────────────────────
+    def triage(self, scan_report: dict) -> tuple[bool, str]:
+        system = (
+            "You are a senior bug bounty triager on HackerOne. "
+            "Your job: look at raw scan output, rank findings by real-world impact, "
+            "flag false positives aggressively, and suggest which findings are worth "
+            "writing up. Use CVSS 3.1 reasoning. Be direct, no corporate fluff. "
+            "Assume the researcher has authorization. Skip legal disclaimers."
+        )
+        # Trim the report to avoid context blowup
+        trimmed = self._trim_report(scan_report)
+        user = (
+            "Here is a scan report. Triage it:\n\n"
+            f"```json\n{json.dumps(trimmed, indent=2)}\n```\n\n"
+            "Output format:\n"
+            "## Critical (P1)\n- <finding> — <why it matters> — <suggested next step>\n\n"
+            "## High (P2)\n...\n\n"
+            "## Likely False Positives\n- <finding> — <why it's noise>\n\n"
+            "## Recommended Follow-ups\n- <specific exploitation path to verify>"
+        )
+        return self._chat(system, user, temperature=0.3, max_tokens=2500)
+
+    def write_h1_report(self, finding: dict, target: str) -> tuple[bool, str]:
+        system = (
+            "You are a top-ranked HackerOne researcher writing a report. "
+            "Match the tone of a professional submission: concise, technical, "
+            "impact-focused. Use markdown headers. No filler."
+        )
+        user = (
+            f"Target: {target}\n\n"
+            f"Finding data:\n```json\n{json.dumps(finding, indent=2)}\n```\n\n"
+            "Write a complete HackerOne report with these sections:\n"
+            "# Title\n## Summary\n## Steps to Reproduce\n## Proof of Concept\n"
+            "## Impact\n## Remediation\n## References (CWE / OWASP)\n\n"
+            "Infer a reasonable title. Use fenced code blocks for requests. "
+            "Estimate CVSS 3.1 score with vector string."
+        )
+        return self._chat(system, user, temperature=0.2, max_tokens=2500)
+
+    def suggest_bypasses(self, path: str, baseline_status: int,
+                         failed_techniques: list) -> tuple[bool, str]:
+        system = (
+            "You are an offensive security expert specializing in WAF, reverse proxy, "
+            "and ACL bypass techniques. You know Nginx, Apache, HAProxy, Cloudflare, "
+            "Akamai, AWS WAF, IIS, and Tomcat internals. Give concrete payloads only, "
+            "no theory. One technique per line, formatted as `curl` commands."
+        )
+        user = (
+            f"Target path: {path}\n"
+            f"Baseline response: HTTP {baseline_status}\n"
+            f"Techniques already tried and failed:\n"
+            + "\n".join(f"- {t}" for t in failed_techniques)
+            + "\n\nSuggest 10 advanced bypass techniques NOT in the above list. "
+            "Focus on: HTTP/2 smuggling, header injection, parser differentials, "
+            "unicode normalization, host header tricks, method overrides. "
+            "Output as curl commands against the target."
+        )
+        return self._chat(system, user, temperature=0.4, max_tokens=2000)
+
+    def classify_response(self, status: int, headers: dict, body_sample: str) -> tuple[bool, str]:
+        system = (
+            "You are a response fingerprinting expert. Given an HTTP response, "
+            "identify: web server, framework, WAF (if any), and whether the "
+            "response looks like a real block, a honeypot, or a misconfiguration. "
+            "Output JSON only, no prose."
+        )
+        user = (
+            f"Status: {status}\n"
+            f"Headers:\n{json.dumps(headers, indent=2)}\n\n"
+            f"Body (first 3000 chars):\n{body_sample[:3000]}\n\n"
+            'Output JSON: {"server":"","framework":"","waf":"","verdict":"","confidence":0-100,"notes":""}'
+        )
+        return self._chat(system, user, temperature=0.1, max_tokens=600)
+
+    @staticmethod
+    def _trim_report(report: dict) -> dict:
+        """Cut down heavy fields to fit in LLM context."""
+        trimmed = json.loads(json.dumps(report))  # deep copy
+        # Drop the raw robots.txt body
+        if "robots_bypass" in trimmed:
+            rb = trimmed["robots_bypass"]
+            rb.pop("robots_content", None)
+            rb.pop("sitemap_urls_sample", None)
+            # Keep only successful bypasses per path
+            if "bypass_results" in rb:
+                rb["bypass_results"] = [
+                    {
+                        "path": r["path"],
+                        "baseline_status": r.get("baseline_status"),
+                        "successful_bypasses": r.get("successful_bypasses", []),
+                    }
+                    for r in rb["bypass_results"]
+                    if r.get("successful_bypasses")
+                ]
+        return trimmed
+
+
 # ─── Scanner ──────────────────────────────────────────────────────────────────
 class SecurityScanner:
     HIDDEN_PATHS = [
@@ -558,6 +720,9 @@ _DEFAULTS = {
     "hidden_files": [],
     "injections": [],
     "endpoints": [],
+    "ai_triage": "",
+    "ai_reports": {},
+    "ai_bypass_suggestions": {},
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -586,6 +751,47 @@ with st.sidebar:
     timeout_val = st.slider("Request timeout (s)", 3, 30, 10)
     workers_val = st.slider("Concurrent workers", 1, 30, 10)
     rate_val = st.slider("Inter-request delay (s)", 0.0, 2.0, 0.1, 0.05)
+
+    st.divider()
+    st.markdown("### 🤖 AI Analysis (OpenRouter)")
+    ai_enabled = st.checkbox("Enable AI", value=False,
+                             help="Triage findings, generate H1 reports, suggest bypasses")
+
+    # Prefer st.secrets if configured, fall back to manual input
+    default_key = ""
+    try:
+        default_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    except Exception:
+        pass
+
+    ai_api_key = st.text_input(
+        "OpenRouter API Key",
+        value=default_key,
+        type="password",
+        disabled=not ai_enabled,
+        help="Get one free at openrouter.ai/keys",
+    )
+
+    ai_model = st.selectbox(
+        "Model",
+        options=[
+            "deepseek/deepseek-chat-v3:free",
+            "google/gemini-2.0-flash-exp:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "qwen/qwen-2.5-coder-32b-instruct:free",
+            "anthropic/claude-3.5-sonnet",
+            "anthropic/claude-3-haiku",
+            "openai/gpt-4o-mini",
+            "openai/gpt-4o",
+            "custom",
+        ],
+        index=0,
+        disabled=not ai_enabled,
+    )
+    if ai_model == "custom":
+        ai_model = st.text_input("Custom model string", value="",
+                                 placeholder="provider/model-name",
+                                 disabled=not ai_enabled)
 
     st.divider()
     start_btn = st.button("🚀 Run Scan", type="primary", use_container_width=True)
@@ -692,6 +898,7 @@ if st.session_state["scan_done"]:
     if enable_hidden_files:  tab_labels.append("📁 Hidden Files")
     if enable_injection:     tab_labels.append("💉 Injections")
     if enable_endpoints:     tab_labels.append("🔗 Endpoints")
+    if ai_enabled:           tab_labels.append("🧠 AI Analysis")
     tab_labels.append("📄 Report")
     tabs = st.tabs(tab_labels)
     idx = 0
@@ -773,6 +980,135 @@ if st.session_state["scan_done"]:
                         st.markdown(f"- {e}")
         idx += 1
 
+    # ── AI Analysis tab ────────────────────────────────────────────────────
+    if ai_enabled:
+        with tabs[idx]:
+            st.subheader("🧠 AI Analysis")
+
+            if not ai_api_key:
+                st.warning("Enter your OpenRouter API key in the sidebar to use AI features.")
+            else:
+                analyzer = AIAnalyzer(api_key=ai_api_key, model=ai_model)
+                st.caption(f"Model: `{ai_model}`")
+
+                # Build the scan report for context
+                current_report = {
+                    "target": target_url,
+                    "summary": {
+                        "disallowed_paths": disallowed_count,
+                        "bypassed_paths": bypassed_count,
+                        "critical_findings": critical_count,
+                        "hidden_files_200": hidden_count,
+                        "injections": len(inj),
+                        "endpoints": len(ep),
+                    },
+                    "robots_bypass": rr,
+                    "hidden_files": hf,
+                    "injections": inj,
+                    "endpoints": ep,
+                }
+
+                # ─── Triage ────────────────────────────────────────────
+                st.markdown("### 1. Triage & Prioritization")
+                col_t1, col_t2 = st.columns([1, 3])
+                with col_t1:
+                    if st.button("🔥 Run Triage", use_container_width=True):
+                        with st.spinner("Analyzing findings..."):
+                            ok, result = analyzer.triage(current_report)
+                            if ok:
+                                st.session_state["ai_triage"] = result
+                            else:
+                                st.error(f"AI error: {result}")
+                                st.session_state["ai_triage"] = ""
+                with col_t2:
+                    st.caption("Ranks findings by real-world impact, flags false positives, suggests follow-ups.")
+
+                if st.session_state.get("ai_triage"):
+                    st.markdown(st.session_state["ai_triage"])
+                    st.download_button(
+                        "📥 Save triage",
+                        data=st.session_state["ai_triage"],
+                        file_name=f"triage_{int(time.time())}.md",
+                        mime="text/markdown",
+                    )
+
+                st.divider()
+
+                # ─── H1 Report Generator ─────────────────────────────
+                st.markdown("### 2. HackerOne Report Generator")
+
+                # Build list of writable findings
+                writable = []
+                for f in rr.get("critical_findings", []):
+                    writable.append(("Robots bypass (critical)", f))
+                for item in hf:
+                    if item["status"] == 200 and item.get("evidence"):
+                        writable.append((f"Hidden file: {item['path']}", item))
+                for item in inj:
+                    writable.append((f"{item['category'].upper()}: {item['payload'][:40]}", item))
+
+                if not writable:
+                    st.info("No critical findings to write up yet.")
+                else:
+                    choice_labels = [w[0] for w in writable]
+                    selected = st.selectbox("Pick a finding to write up", choice_labels)
+                    selected_data = writable[choice_labels.index(selected)][1]
+
+                    if st.button("📝 Generate H1 Report", use_container_width=False):
+                        with st.spinner("Writing report..."):
+                            ok, result = analyzer.write_h1_report(selected_data, target_url)
+                            if ok:
+                                st.session_state["ai_reports"][selected] = result
+                            else:
+                                st.error(f"AI error: {result}")
+
+                    if selected in st.session_state.get("ai_reports", {}):
+                        report_md = st.session_state["ai_reports"][selected]
+                        st.markdown(report_md)
+                        st.download_button(
+                            "📥 Save report",
+                            data=report_md,
+                            file_name=f"h1_report_{int(time.time())}.md",
+                            mime="text/markdown",
+                            key=f"dl_{selected}",
+                        )
+
+                st.divider()
+
+                # ─── Bypass Suggester ─────────────────────────────────
+                st.markdown("### 3. Advanced Bypass Suggester")
+                st.caption("For paths where no technique worked — AI suggests techniques not yet tried.")
+
+                stubborn = [
+                    r for r in rr.get("bypass_results", [])
+                    if not r.get("successful_bypasses") and r.get("baseline_status") in (401, 403, 404)
+                ]
+                if not stubborn:
+                    st.info("No stubborn paths — everything was either bypassed or not protected.")
+                else:
+                    stubborn_paths = [r["path"] for r in stubborn]
+                    picked = st.selectbox("Path that resisted all bypasses", stubborn_paths)
+                    picked_result = next(r for r in stubborn if r["path"] == picked)
+                    tried_techniques = [
+                        b["technique"] for b in picked_result.get("bypasses", [])
+                    ] or ["path_mutations", "header_bypasses", "method_bypasses"]
+
+                    if st.button("💡 Suggest new techniques", use_container_width=False):
+                        with st.spinner("Consulting AI..."):
+                            ok, result = analyzer.suggest_bypasses(
+                                picked,
+                                picked_result["baseline_status"],
+                                tried_techniques,
+                            )
+                            if ok:
+                                st.session_state["ai_bypass_suggestions"][picked] = result
+                            else:
+                                st.error(f"AI error: {result}")
+
+                    if picked in st.session_state.get("ai_bypass_suggestions", {}):
+                        st.markdown(st.session_state["ai_bypass_suggestions"][picked])
+        idx += 1
+
     with tabs[-1]:
         st.subheader("📄 JSON Report")
         report = {
@@ -792,6 +1128,13 @@ if st.session_state["scan_done"]:
             "hidden_files": hf,
             "injections": inj,
             "endpoints": ep,
+            "ai": {
+                "enabled": ai_enabled,
+                "model": ai_model if ai_enabled else None,
+                "triage": st.session_state.get("ai_triage", ""),
+                "h1_reports": st.session_state.get("ai_reports", {}),
+                "bypass_suggestions": st.session_state.get("ai_bypass_suggestions", {}),
+            },
         }
         st.download_button(
             "📥 Download JSON Report",
