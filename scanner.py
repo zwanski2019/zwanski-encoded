@@ -5,6 +5,7 @@ Adds: real header/method bypasses, sitemap.xml discovery, threading, better evid
 
 Legal: authorized targets only.
 """
+from __future__ import annotations
 
 import streamlit as st
 import urllib.request
